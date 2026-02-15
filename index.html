@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Advanced Browser AutoTune</title>
+<style>
+body { font-family: Arial; text-align:center; background:#111; color:white; }
+button { padding:10px 20px; margin:10px; }
+progress { width:80%; }
+</style>
+</head>
+<body>
+
+<h2>🎵 Advanced Auto Key Detect + AutoTune</h2>
+
+<input type="file" id="fileInput" accept="audio/*"><br><br>
+<button onclick="processAudio()">Auto Detect & Tune</button><br>
+<progress id="progressBar" value="0" max="100"></progress>
+<br><br>
+<audio id="player" controls></audio><br>
+<button id="downloadBtn" style="display:none">Download Tuned Audio</button>
+
+<script>
+
+let audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+function freqToMidi(freq){
+    return 69 + 12 * Math.log2(freq/440);
+}
+
+function midiToFreq(midi){
+    return 440 * Math.pow(2,(midi-69)/12);
+}
+
+function autoCorrelate(buf, sampleRate){
+    let SIZE = buf.length;
+    let rms = 0;
+
+    for(let i=0;i<SIZE;i++){
+        let val = buf[i];
+        rms += val*val;
+    }
+    rms = Math.sqrt(rms/SIZE);
+    if(rms < 0.01) return -1;
+
+    let r1=0, r2=SIZE-1, thresh=0.2;
+    for(let i=0;i<SIZE/2;i++){
+        if(Math.abs(buf[i])<thresh){ r1=i; break;}
+    }
+    for(let i=1;i<SIZE/2;i++){
+        if(Math.abs(buf[SIZE-i])<thresh){ r2=SIZE-i; break;}
+    }
+
+    buf = buf.slice(r1,r2);
+    SIZE = buf.length;
+
+    let c = new Array(SIZE).fill(0);
+    for(let i=0;i<SIZE;i++){
+        for(let j=0;j<SIZE-i;j++){
+            c[i] += buf[j]*buf[j+i];
+        }
+    }
+
+    let d=0; while(c[d]>c[d+1]) d++;
+    let maxval=-1, maxpos=-1;
+    for(let i=d;i<SIZE;i++){
+        if(c[i]>maxval){ maxval=c[i]; maxpos=i;}
+    }
+
+    let T0 = maxpos;
+    return sampleRate/T0;
+}
+
+function detectKey(pitches){
+    let counts = new Array(12).fill(0);
+    pitches.forEach(p=>{
+        let midi = Math.round(freqToMidi(p));
+        counts[midi%12]++;
+    });
+    let maxIndex = counts.indexOf(Math.max(...counts));
+    return maxIndex;
+}
+
+function buildMajorScale(root){
+    let pattern=[0,2,4,5,7,9,11];
+    return pattern.map(x=>(x+root)%12);
+}
+
+function nearestNote(midi, scale){
+    let best = midi;
+    let minDist=999;
+    for(let octave=-2;octave<=2;octave++){
+        scale.forEach(note=>{
+            let candidate = note + octave*12;
+            let dist = Math.abs(candidate - midi);
+            if(dist < minDist){
+                minDist = dist;
+                best = candidate;
+            }
+        });
+    }
+    return best;
+}
+
+async function processAudio(){
+    const file = document.getElementById("fileInput").files[0];
+    if(!file) return alert("Upload audio first!");
+
+    document.getElementById("progressBar").value = 5;
+
+    const arrayBuffer = await file.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+    const inputData = audioBuffer.getChannelData(0);
+    const sampleRate = audioBuffer.sampleRate;
+    const frameSize = 2048;
+    const hopSize = 512;
+
+    let pitches=[];
+    let frames=[];
+
+    for(let i=0;i<inputData.length-frameSize;i+=hopSize){
+        let frame = inputData.slice(i,i+frameSize);
+        let freq = autoCorrelate(frame,sampleRate);
+        if(freq>50 && freq<1000){
+            pitches.push(freq);
+            frames.push({index:i, freq:freq});
+        }
+    }
+
+    document.getElementById("progressBar").value = 40;
+
+    let root = detectKey(pitches);
+    let scale = buildMajorScale(root);
+
+    let output = new Float32Array(inputData.length);
+    output.set(inputData);
+
+    frames.forEach(f=>{
+        let midi = freqToMidi(f.freq);
+        let correctedMidi = nearestNote(midi, scale);
+        let ratio = midiToFreq(correctedMidi)/f.freq;
+
+        for(let j=0;j<frameSize;j++){
+            let idx = f.index + j;
+            if(idx < output.length){
+                output[idx] *= ratio;
+            }
+        }
+    });
+
+    document.getElementById("progressBar").value = 80;
+
+    let newBuffer = audioContext.createBuffer(1, output.length, sampleRate);
+    newBuffer.copyToChannel(output,0);
+
+    let dest = audioContext.createMediaStreamDestination();
+    let source = audioContext.createBufferSource();
+    source.buffer = newBuffer;
+    source.connect(audioContext.destination);
+    source.start();
+
+    let offlineCtx = new OfflineAudioContext(1, output.length, sampleRate);
+    let offlineSource = offlineCtx.createBufferSource();
+    offlineSource.buffer = newBuffer;
+    offlineSource.connect(offlineCtx.destination);
+    offlineSource.start();
+
+    let rendered = await offlineCtx.startRendering();
+
+    let wav = bufferToWave(rendered, rendered.length);
+    let blob = new Blob([wav], {type:"audio/wav"});
+    let url = URL.createObjectURL(blob);
+
+    document.getElementById("player").src = url;
+    document.getElementById("downloadBtn").style.display="inline";
+    document.getElementById("downloadBtn").onclick = ()=>{
+        let a=document.createElement("a");
+        a.href=url;
+        a.download="autotuned.wav";
+        a.click();
+    }
+
+    document.getElementById("progressBar").value = 100;
+}
+
+function bufferToWave(abuffer, len){
+    let numOfChan = abuffer.numberOfChannels,
+    length = len * numOfChan * 2 + 44,
+    buffer = new ArrayBuffer(length),
+    view = new DataView(buffer),
+    channels = [],
+    i, sample,
+    offset = 0,
+    pos = 0;
+
+    function setUint16(data){ view.setUint16(pos,data,true); pos+=2;}
+    function setUint32(data){ view.setUint32(pos,data,true); pos+=4;}
+
+    setUint32(0x46464952);
+    setUint32(length-8);
+    setUint32(0x45564157);
+
+    setUint32(0x20746d66);
+    setUint32(16);
+    setUint16(1);
+    setUint16(numOfChan);
+    setUint32(abuffer.sampleRate);
+    setUint32(abuffer.sampleRate*2*numOfChan);
+    setUint16(numOfChan*2);
+    setUint16(16);
+
+    setUint32(0x61746164);
+    setUint32(length-pos-4);
+
+    for(i=0;i<abuffer.numberOfChannels;i++)
+        channels.push(abuffer.getChannelData(i));
+
+    while(pos<length){
+        for(i=0;i<numOfChan;i++){
+            sample=Math.max(-1,Math.min(1,channels[i][offset]));
+            sample=(0.5+sample<0?sample*32768:sample*32767)|0;
+            view.setInt16(pos,sample,true);
+            pos+=2;
+        }
+        offset++;
+    }
+    return buffer;
+}
+
+</script>
+
+</body>
+</html>
