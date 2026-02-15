@@ -2,94 +2,111 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Advanced Browser AutoTune</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AutoTune Pro</title>
+
 <style>
-body { font-family: Arial; text-align:center; background:#111; color:white; }
-button { padding:10px 20px; margin:10px; }
-progress { width:80%; }
+body{
+    background:#0d0d0d;
+    color:white;
+    font-family:Arial;
+    text-align:center;
+    padding:20px;
+}
+h2{
+    font-size:22px;
+}
+input,button{
+    font-size:18px;
+    padding:10px;
+    margin:10px;
+}
+progress{
+    width:100%;
+    height:20px;
+}
+audio{
+    width:100%;
+    margin-top:20px;
+}
 </style>
 </head>
+
 <body>
 
-<h2>🎵 Advanced Auto Key Detect + AutoTune</h2>
+<h2>🎵 Auto Key Detect + AutoTune</h2>
 
-<input type="file" id="fileInput" accept="audio/*"><br><br>
-<button onclick="processAudio()">Auto Detect & Tune</button><br>
+<input type="file" id="fileInput" accept="audio/*"><br>
+
+<button onclick="processAudio()">Detect & Tune</button>
+
+<p id="status">Waiting for upload...</p>
+
 <progress id="progressBar" value="0" max="100"></progress>
-<br><br>
-<audio id="player" controls></audio><br>
-<button id="downloadBtn" style="display:none">Download Tuned Audio</button>
+
+<audio id="player" controls></audio>
 
 <script>
 
 let audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
 function freqToMidi(freq){
-    return 69 + 12 * Math.log2(freq/440);
+    return 69 + 12*Math.log2(freq/440);
 }
 
 function midiToFreq(midi){
-    return 440 * Math.pow(2,(midi-69)/12);
+    return 440*Math.pow(2,(midi-69)/12);
 }
 
-function autoCorrelate(buf, sampleRate){
-    let SIZE = buf.length;
-    let rms = 0;
+// LIGHTWEIGHT autocorrelation (optimized)
+function detectPitch(buffer, sampleRate){
+    let SIZE = buffer.length;
+    let maxSamples = Math.floor(SIZE/2);
+    let bestOffset = -1;
+    let bestCorrelation = 0;
 
-    for(let i=0;i<SIZE;i++){
-        let val = buf[i];
-        rms += val*val;
-    }
-    rms = Math.sqrt(rms/SIZE);
-    if(rms < 0.01) return -1;
+    for(let offset=8; offset<maxSamples; offset++){
+        let correlation = 0;
 
-    let r1=0, r2=SIZE-1, thresh=0.2;
-    for(let i=0;i<SIZE/2;i++){
-        if(Math.abs(buf[i])<thresh){ r1=i; break;}
-    }
-    for(let i=1;i<SIZE/2;i++){
-        if(Math.abs(buf[SIZE-i])<thresh){ r2=SIZE-i; break;}
-    }
+        for(let i=0; i<maxSamples; i++){
+            correlation += Math.abs(buffer[i] - buffer[i+offset]);
+        }
 
-    buf = buf.slice(r1,r2);
-    SIZE = buf.length;
+        correlation = 1 - (correlation/maxSamples);
 
-    let c = new Array(SIZE).fill(0);
-    for(let i=0;i<SIZE;i++){
-        for(let j=0;j<SIZE-i;j++){
-            c[i] += buf[j]*buf[j+i];
+        if(correlation > bestCorrelation){
+            bestCorrelation = correlation;
+            bestOffset = offset;
         }
     }
 
-    let d=0; while(c[d]>c[d+1]) d++;
-    let maxval=-1, maxpos=-1;
-    for(let i=d;i<SIZE;i++){
-        if(c[i]>maxval){ maxval=c[i]; maxpos=i;}
+    if(bestCorrelation > 0.01){
+        return sampleRate/bestOffset;
     }
-
-    let T0 = maxpos;
-    return sampleRate/T0;
+    return -1;
 }
 
 function detectKey(pitches){
     let counts = new Array(12).fill(0);
+
     pitches.forEach(p=>{
         let midi = Math.round(freqToMidi(p));
         counts[midi%12]++;
     });
-    let maxIndex = counts.indexOf(Math.max(...counts));
-    return maxIndex;
+
+    return counts.indexOf(Math.max(...counts));
 }
 
 function buildMajorScale(root){
     let pattern=[0,2,4,5,7,9,11];
-    return pattern.map(x=>(x+root)%12);
+    return pattern.map(n=>(n+root)%12);
 }
 
 function nearestNote(midi, scale){
-    let best = midi;
     let minDist=999;
-    for(let octave=-2;octave<=2;octave++){
+    let best=midi;
+
+    for(let octave=-2; octave<=2; octave++){
         scale.forEach(note=>{
             let candidate = note + octave*12;
             let dist = Math.abs(candidate - midi);
@@ -103,43 +120,59 @@ function nearestNote(midi, scale){
 }
 
 async function processAudio(){
+
     const file = document.getElementById("fileInput").files[0];
     if(!file) return alert("Upload audio first!");
 
-    document.getElementById("progressBar").value = 5;
+    document.getElementById("status").innerText="Decoding audio...";
+    document.getElementById("progressBar").value=10;
 
     const arrayBuffer = await file.arrayBuffer();
     const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
 
     const inputData = audioBuffer.getChannelData(0);
     const sampleRate = audioBuffer.sampleRate;
-    const frameSize = 2048;
-    const hopSize = 512;
+
+    const frameSize = 1024; // smaller = mobile friendly
+    const hopSize = 1024;
 
     let pitches=[];
     let frames=[];
 
+    document.getElementById("status").innerText="Analyzing pitch...";
+
     for(let i=0;i<inputData.length-frameSize;i+=hopSize){
+
+        if(i % 50000 === 0){
+            document.getElementById("progressBar").value = 
+                20 + (i/inputData.length)*40;
+            await new Promise(r=>setTimeout(r,1)); // prevent freeze
+        }
+
         let frame = inputData.slice(i,i+frameSize);
-        let freq = autoCorrelate(frame,sampleRate);
-        if(freq>50 && freq<1000){
+        let freq = detectPitch(frame,sampleRate);
+
+        if(freq>70 && freq<800){
             pitches.push(freq);
             frames.push({index:i, freq:freq});
         }
     }
 
-    document.getElementById("progressBar").value = 40;
+    document.getElementById("status").innerText="Detecting key...";
+    document.getElementById("progressBar").value=65;
 
     let root = detectKey(pitches);
     let scale = buildMajorScale(root);
+
+    document.getElementById("status").innerText="Applying correction...";
 
     let output = new Float32Array(inputData.length);
     output.set(inputData);
 
     frames.forEach(f=>{
         let midi = freqToMidi(f.freq);
-        let correctedMidi = nearestNote(midi, scale);
-        let ratio = midiToFreq(correctedMidi)/f.freq;
+        let corrected = nearestNote(midi,scale);
+        let ratio = midiToFreq(corrected)/f.freq;
 
         for(let j=0;j<frameSize;j++){
             let idx = f.index + j;
@@ -149,83 +182,27 @@ async function processAudio(){
         }
     });
 
-    document.getElementById("progressBar").value = 80;
+    document.getElementById("progressBar").value=90;
 
     let newBuffer = audioContext.createBuffer(1, output.length, sampleRate);
     newBuffer.copyToChannel(output,0);
 
-    let dest = audioContext.createMediaStreamDestination();
-    let source = audioContext.createBufferSource();
-    source.buffer = newBuffer;
-    source.connect(audioContext.destination);
-    source.start();
-
     let offlineCtx = new OfflineAudioContext(1, output.length, sampleRate);
-    let offlineSource = offlineCtx.createBufferSource();
-    offlineSource.buffer = newBuffer;
-    offlineSource.connect(offlineCtx.destination);
-    offlineSource.start();
+    let source = offlineCtx.createBufferSource();
+    source.buffer = newBuffer;
+    source.connect(offlineCtx.destination);
+    source.start();
 
     let rendered = await offlineCtx.startRendering();
 
-    let wav = bufferToWave(rendered, rendered.length);
-    let blob = new Blob([wav], {type:"audio/wav"});
-    let url = URL.createObjectURL(blob);
+    let wavBlob = new Blob([rendered.getChannelData(0)], {type:"audio/wav"});
+    let url = URL.createObjectURL(wavBlob);
 
     document.getElementById("player").src = url;
-    document.getElementById("downloadBtn").style.display="inline";
-    document.getElementById("downloadBtn").onclick = ()=>{
-        let a=document.createElement("a");
-        a.href=url;
-        a.download="autotuned.wav";
-        a.click();
-    }
 
-    document.getElementById("progressBar").value = 100;
-}
+    document.getElementById("progressBar").value=100;
+    document.getElementById("status").innerText="Done!";
 
-function bufferToWave(abuffer, len){
-    let numOfChan = abuffer.numberOfChannels,
-    length = len * numOfChan * 2 + 44,
-    buffer = new ArrayBuffer(length),
-    view = new DataView(buffer),
-    channels = [],
-    i, sample,
-    offset = 0,
-    pos = 0;
-
-    function setUint16(data){ view.setUint16(pos,data,true); pos+=2;}
-    function setUint32(data){ view.setUint32(pos,data,true); pos+=4;}
-
-    setUint32(0x46464952);
-    setUint32(length-8);
-    setUint32(0x45564157);
-
-    setUint32(0x20746d66);
-    setUint32(16);
-    setUint16(1);
-    setUint16(numOfChan);
-    setUint32(abuffer.sampleRate);
-    setUint32(abuffer.sampleRate*2*numOfChan);
-    setUint16(numOfChan*2);
-    setUint16(16);
-
-    setUint32(0x61746164);
-    setUint32(length-pos-4);
-
-    for(i=0;i<abuffer.numberOfChannels;i++)
-        channels.push(abuffer.getChannelData(i));
-
-    while(pos<length){
-        for(i=0;i<numOfChan;i++){
-            sample=Math.max(-1,Math.min(1,channels[i][offset]));
-            sample=(0.5+sample<0?sample*32768:sample*32767)|0;
-            view.setInt16(pos,sample,true);
-            pos+=2;
-        }
-        offset++;
-    }
-    return buffer;
 }
 
 </script>
